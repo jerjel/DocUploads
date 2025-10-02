@@ -1,0 +1,371 @@
+Here's an efficient framework design for scoring with H5 files containing model parameters:
+
+Framework Design
+import h5py
+import numpy as np
+import pandas as pd
+from typing import Dict, Any, List, Union, Optional
+from pathlib import Path
+from abc import ABC, abstractmethod
+import logging
+from dataclasses import dataclass
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ModelConfig:
+    """Configuration for the scoring model"""
+    h5_path: str
+    group_id: str
+    intercept_key: str = 'intercept'
+    features_key: str = 'features'
+    coefficients_key: str = 'coefficients'
+    required_features: Optional[List[str]] = None
+
+class ScoringException(Exception):
+    """Custom exception for scoring operations"""
+    pass
+
+class BaseScorer(ABC):
+    """Abstract base class for scoring operations"""
+    
+    @abstractmethod
+    def score(self, features: pd.DataFrame) -> np.ndarray:
+        """Score the input features"""
+        pass
+    
+    @abstractmethod
+    def validate_features(self, features: pd.DataFrame) -> bool:
+        """Validate input features"""
+        pass
+
+class H5ModelLoader:
+    """Efficient H5 file loader with caching"""
+    
+    def __init__(self, h5_path: Union[str, Path]):
+        self.h5_path = Path(h5_path)
+        self._cache = {}
+    
+    @lru_cache(maxsize=128)  # Cache model data
+    def load_model_data(self, group_id: str) -> Dict[str, Any]:
+        """Load model data from H5 file with caching"""
+        if not self.h5_path.exists():
+            raise ScoringException(f"H5 file does not exist: {self.h5_path}")
+        
+        try:
+            with h5py.File(self.h5_path, 'r') as h5_file:
+                if group_id not in h5_file:
+                    raise ScoringException(f"Group '{group_id}' not found in H5 file")
+                
+                group = h5_file[group_id]
+                
+                model_data = {
+                    'intercept': group['intercept'][()] if 'intercept' in group else 0.0,
+                    'features': [f.decode() if isinstance(f, bytes) else f for f in group['features'][()]],
+                    'coefficients': group['coefficients'][()]
+                }
+                
+                # Validate dimensions
+                if len(model_data['features']) != len(model_data['coefficients']):
+                    raise ScoringException("Features and coefficients length mismatch")
+                
+                return model_data
+                
+        except Exception as e:
+            raise ScoringException(f"Error loading model data: {str(e)}")
+
+class LinearModelScorer(BaseScorer):
+    """Scorer for linear models (linear regression, logistic regression, etc.)"""
+    
+    def __init__(self, config: ModelConfig):
+        self.config = config
+        self.loader = H5ModelLoader(config.h5_path)
+        self.model_data = self.loader.load_model_data(config.group_id)
+        
+        # Convert to numpy arrays for efficient computation
+        self.features = np.array(self.model_data['features'])
+        self.coefficients = np.array(self.model_data['coefficients'])
+        self.intercept = float(self.model_data['intercept'])
+        
+        logger.info(f"Loaded model with {len(self.features)} features")
+    
+    def validate_features(self, features_df: pd.DataFrame) -> bool:
+        """Validate that input features match the model's expected features"""
+        missing_features = set(self.features) - set(features_df.columns)
+        if missing_features:
+            raise ScoringException(f"Missing features: {missing_features}")
+        
+        return True
+    
+    def score(self, features_df: pd.DataFrame) -> np.ndarray:
+        """Score the input features using linear model"""
+        self.validate_features(features_df)
+        
+        # Select only the features the model expects, in the correct order
+        feature_matrix = features_df[self.features].values
+        
+        # Perform linear combination: X * coefficients + intercept
+        scores = np.dot(feature_matrix, self.coefficients) + self.intercept
+        
+        return scores
+
+class LogisticScorer(LinearModelScorer):
+    """Scorer for logistic regression models"""
+    
+    def score(self, features_df: pd.DataFrame) -> np.ndarray:
+        """Score and apply sigmoid transformation for logistic regression"""
+        linear_scores = super().score(features_df)
+        
+        # Apply sigmoid function
+        probabilities = 1 / (1 + np.exp(-linear_scores))
+        
+        return probabilities
+
+class ScoringFramework:
+    """Main framework for scoring operations"""
+    
+    def __init__(self):
+        self.scorers: Dict[str, BaseScorer] = {}
+        self.configs: Dict[str, ModelConfig] = {}
+    
+    def register_model(self, model_id: str, config: ModelConfig) -> None:
+        """Register a model configuration"""
+        self.configs[model_id] = config
+        
+        # Auto-detect model type based on configuration or add parameter
+        if 'logistic' in model_id.lower() or 'logistic' in config.group_id.lower():
+            scorer = LogisticScorer(config)
+        else:
+            scorer = LinearModelScorer(config)
+        
+        self.scorers[model_id] = scorer
+        logger.info(f"Registered model: {model_id}")
+    
+    def score(self, model_id: str, features_df: pd.DataFrame) -> np.ndarray:
+        """Score using the specified model"""
+        if model_id not in self.scorers:
+            raise ScoringException(f"Model '{model_id}' not registered")
+        
+        return self.scorers[model_id].score(features_df)
+    
+    def validate_features(self, model_id: str, features_df: pd.DataFrame) -> bool:
+        """Validate features for the specified model"""
+        if model_id not in self.scorers:
+            raise ScoringException(f"Model '{model_id}' not registered")
+        
+        return self.scorers[model_id].validate_features(features_df)
+    
+    def get_model_info(self, model_id: str) -> Dict[str, Any]:
+        """Get information about a registered model"""
+        if model_id not in self.scorers:
+            raise ScoringException(f"Model '{model_id}' not registered")
+        
+        scorer = self.scorers[model_id]
+        return {
+            'model_id': model_id,
+            'num_features': len(scorer.features),
+            'features': list(scorer.features),
+            'intercept': scorer.intercept
+        }
+
+# Utility functions for H5 file creation
+def create_h5_model(h5_path: Union[str, Path], 
+                   group_id: str, 
+                   features: List[str], 
+                   coefficients: List[float], 
+                   intercept: float = 0.0) -> None:
+    """Utility function to create H5 model file"""
+    h5_path = Path(h5_path)
+    
+    with h5py.File(h5_path, 'w') as h5_file:
+        group = h5_file.create_group(group_id)
+        
+        # Store features as strings
+        group.create_dataset('features', data=[f.encode('utf-8') for f in features])
+        
+        # Store coefficients
+        group.create_dataset('coefficients', data=coefficients)
+        
+        # Store intercept
+        group.create_dataset('intercept', data=intercept)
+
+# Example usage and testing
+def example_usage():
+    """Example of how to use the framework"""
+    
+    # Create sample H5 file
+    sample_features = ['age', 'income', 'credit_score', 'loan_amount']
+    sample_coefficients = [0.1, 0.005, 0.01, -0.002]
+    sample_intercept = 0.5
+    
+    create_h5_model('sample_model.h5', 'credit_model', 
+                   sample_features, sample_coefficients, sample_intercept)
+    
+    # Initialize framework
+    framework = ScoringFramework()
+    
+    # Register model
+    config = ModelConfig(
+        h5_path='sample_model.h5',
+        group_id='credit_model'
+    )
+    framework.register_model('credit_scoring', config)
+    
+    # Create sample data
+    sample_data = pd.DataFrame({
+        'age': [25, 35, 45],
+        'income': [50000, 75000, 100000],
+        'credit_score': [650, 720, 780],
+        'loan_amount': [10000, 25000, 50000]
+    })
+    
+    # Score the data
+    scores = framework.score('credit_scoring', sample_data)
+    print(f"Scores: {scores}")
+    
+    # Get model info
+    model_info = framework.get_model_info('credit_scoring')
+    print(f"Model info: {model_info}")
+
+if __name__ == "__main__":
+    example_usage()
+⌄
+⌄
+⌄
+⌄
+⌄
+import h5py
+                   features: List[str], 
+                   coefficients: List[float], 
+                   intercept: float = 0.0) -> None:
+    """Utility function to create H5 model file"""
+    h5_path = Path(h5_path)
+    
+    with h5py.File(h5_path, 'w') as h5_file:
+        group = h5_file.create_group(group_id)
+        
+        # Store features as strings
+        group.create_dataset('features', data=[f.encode('utf-8') for f in features])
+        
+        # Store coefficients
+        group.create_dataset('coefficients', data=coefficients)
+        
+        # Store intercept
+        group.create_dataset('intercept', data=intercept)
+
+# Example usage and testing
+def example_usage():
+    """Example of how to use the framework"""
+    
+    # Create sample H5 file
+    sample_features = ['age', 'income', 'credit_score', 'loan_amount']
+    sample_coefficients = [0.1, 0.005, 0.01, -0.002]
+    sample_intercept = 0.5
+    
+    create_h5_model('sample_model.h5', 'credit_model', 
+                   sample_features, sample_coefficients, sample_intercept)
+    
+    # Initialize framework
+    framework = ScoringFramework()
+    
+    # Register model
+    config = ModelConfig(
+        h5_path='sample_model.h5',
+        group_id='credit_model'
+    )
+    framework.register_model('credit_scoring', config)
+    
+    # Create sample data
+    sample_data = pd.DataFrame({
+        'age': [25, 35, 45],
+        'income': [50000, 75000, 100000],
+        'credit_score': [650, 720, 780],
+        'loan_amount': [10000, 25000, 50000]
+    })
+    
+    # Score the data
+    scores = framework.score('credit_scoring', sample_data)
+    print(f"Scores: {scores}")
+    
+    # Get model info
+    model_info = framework.get_model_info('credit_scoring')
+    print(f"Model info: {model_info}")
+
+if __name__ == "__main__":
+    example_usage()
+
+Advanced Features
+For even more efficiency and flexibility, here's an enhanced version with batch processing and validation:
+
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from typing import Iterator
+
+class BatchScorer:
+    """Enhanced scorer with batch processing capabilities"""
+    
+    def __init__(self, framework: ScoringFramework):
+        self.framework = framework
+        self._lock = threading.Lock()
+    
+    def score_batch(self, 
+                   model_id: str, 
+                   features_df: pd.DataFrame, 
+                   batch_size: int = 1000,
+                   num_threads: int = 1) -> np.ndarray:
+        """Score in batches for large datasets"""
+        
+        if len(features_df) <= batch_size:
+            return self.framework.score(model_id, features_df)
+        
+        # Split into batches
+        batches = [features_df[i:i + batch_size] for i in range(0, len(features_df), batch_size)]
+        
+        if num_threads == 1:
+            # Single-threaded processing
+            results = []
+            for batch in batches:
+                results.append(self.framework.score(model_id, batch))
+        else:
+            # Multi-threaded processing
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = [executor.submit(self.framework.score, model_id, batch) for batch in batches]
+                results = [future.result() for future in futures]
+        
+        return np.concatenate(results)
+    
+    def score_streaming(self, 
+                       model_id: str, 
+                       data_iterator: Iterator[pd.DataFrame]) -> Iterator[np.ndarray]:
+        """Score data from an iterator (for very large datasets)"""
+        for batch in data_iterator:
+            yield self.framework.score(model_id, batch)
+
+# Usage example for large datasets
+def large_dataset_example():
+    framework = ScoringFramework()
+    
+    # Register your model
+    config = ModelConfig(h5_path='large_model.h5', group_id='production_model')
+    framework.register_model('prod_model', config)
+    
+    # Create batch scorer
+    batch_scorer = BatchScorer(framework)
+    
+    # For large datasets, process in batches
+    large_df = pd.DataFrame(...)  # Your large dataset
+    scores = batch_scorer.score_batch('prod_model', large_df, batch_size=5000, num_threads=4)
+    
+    return scores
+
+Key Features of This Design:
+Efficient H5 Loading: Uses lru_cache for caching model data
+Type Safety: Uses type hints for better code quality
+Validation: Validates input features against model requirements
+Flexibility: Supports different model types (linear, logistic, etc.)
+Scalability: Batch processing for large datasets
+Error Handling: Comprehensive error handling with custom exceptions
+Memory Efficient: Uses numpy arrays for fast computation
+Thread-Safe: Can be used in multi-threaded environments
+This framework is production-ready and can handle various scoring scenarios efficiently!
