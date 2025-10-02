@@ -1,0 +1,339 @@
+# my_framework/__init__.py
+import logging
+
+# Create library logger with proper namespace
+logger = logging.getLogger(__name__)
+# Never add handlers to library loggers - let the application decide
+logger.addHandler(logging.NullHandler())
+
+# Define library-specific logging levels
+from enum import IntEnum
+
+class FrameworkLogLevel(IntEnum):
+    """Custom log levels for the framework"""
+    SCORE_START = 25
+    SCORE_COMPLETE = 26
+    MODEL_LOAD = 27
+    CACHE_HIT = 28
+    CACHE_MISS = 29
+
+# Add custom levels to logging
+logging.addLevelName(FrameworkLogLevel.SCORE_START, "SCORE_START")
+logging.addLevelName(FrameworkLogLevel.SCORE_COMPLETE, "SCORE_COMPLETE")
+logging.addLevelName(FrameworkLogLevel.MODEL_LOAD, "MODEL_LOAD")
+logging.addLevelName(FrameworkLogLevel.CACHE_HIT, "CACHE_HIT")
+logging.addLevelName(FrameworkLogLevel.CACHE_MISS, "CACHE_MISS")
+
+def score_start(self, message, *args, **kwargs):
+    if self.isEnabledFor(FrameworkLogLevel.SCORE_START):
+        self._log(FrameworkLogLevel.SCORE_START, message, args, **kwargs)
+
+def score_complete(self, message, *args, **kwargs):
+    if self.isEnabledFor(FrameworkLogLevel.SCORE_COMPLETE):
+        self._log(FrameworkLogLevel.SCORE_COMPLETE, message, args, **kwargs)
+
+def model_load(self, message, *args, **kwargs):
+    if self.isEnabledFor(FrameworkLogLevel.MODEL_LOAD):
+        self._log(FrameworkLogLevel.MODEL_LOAD, message, args, **kwargs)
+
+def cache_hit(self, message, *args, **kwargs):
+    if self.isEnabledFor(FrameworkLogLevel.CACHE_HIT):
+        self._log(FrameworkLogLevel.CACHE_HIT, message, args, **kwargs)
+
+def cache_miss(self, message, *args, **kwargs):
+    if self.isEnabledFor(FrameworkLogLevel.CACHE_MISS):
+        self._log(FrameworkLogLevel.CACHE_MISS, message, args, **kwargs)
+
+# Add custom methods to Logger class
+logging.Logger.score_start = score_start
+logging.Logger.score_complete = score_complete
+logging.Logger.model_load = model_load
+logging.Logger.cache_hit = cache_hit
+logging.Logger.cache_miss = cache_miss
+
+####COnfiguration
+# my_framework/logging_config.py
+import logging
+import sys
+from typing import Optional
+from pathlib import Path
+
+class FrameworkLogger:
+    """Framework-specific logger configuration"""
+    
+    def __init__(self, name: str = None):
+        self.logger_name = name or __package__ or "my_framework"
+        self.logger = logging.getLogger(self.logger_name)
+        
+    def configure_for_framework(self, 
+                              level: int = logging.INFO,
+                              log_format: str = None,
+                              enable_file_logging: bool = False,
+                              log_file: str = None,
+                              max_bytes: int = 10*1024*1024,  # 10MB
+                              backup_count: int = 5) -> None:
+        """
+        Configure logging for the framework (library-level configuration)
+        This should be called by the application using the framework
+        """
+        # Don't configure if already configured (avoid duplicate handlers)
+        if hasattr(self.logger, '_framework_configured') and self.logger._framework_configured:
+            return
+        
+        # Set the level
+        self.logger.setLevel(level)
+        
+        # Create formatter
+        if log_format is None:
+            log_format = (
+                '%(asctime)s - %(name)s - %(levelname)s - '
+                '%(funcName)s:%(lineno)d - %(message)s'
+            )
+        
+        formatter = logging.Formatter(log_format)
+        
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        self.logger.addHandler(console_handler)
+        
+        # File handler (optional)
+        if enable_file_logging and log_file:
+            from logging.handlers import RotatingFileHandler
+            file_handler = RotatingFileHandler(
+                log_file, maxBytes=max_bytes, backupCount=backup_count
+            )
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+        
+        # Mark as configured
+        self.logger._framework_configured = True
+    
+    def get_logger(self) -> logging.Logger:
+        """Get the configured logger"""
+        return self.logger
+
+# Global logger instance for the framework
+_framework_logger = FrameworkLogger()
+
+def get_framework_logger() -> logging.Logger:
+    """Get the framework logger instance"""
+    return _framework_logger.get_logger()
+
+def configure_framework_logging(**kwargs) -> None:
+    """Configure framework logging - should be called by application"""
+    _framework_logger.configure_for_framework(**kwargs)
+
+###Usage.
+# my_framework/core.py
+import logging
+from .logging_config import get_framework_logger
+
+logger = get_framework_logger()  # Use the framework logger
+
+class H5ModelLoader:
+    def __init__(self, h5_path: str):
+        self.h5_path = h5_path
+        self._cache = {}
+        logger.debug("H5ModelLoader initialized for path: %s", h5_path)
+    
+    @lru_cache(maxsize=128)
+    def load_model_data(self, group_id: str) -> Dict[str, Any]:
+        cache_key = f"{self.h5_path}_{group_id}"
+        
+        if cache_key in self._cache:
+            logger.cache_hit("Cache hit for model: %s", cache_key)
+            return self._cache[cache_key]
+        
+        logger.cache_miss("Cache miss for model: %s, loading from H5", cache_key)
+        
+        try:
+            with h5py.File(self.h5_path, 'r') as h5_file:
+                if group_id not in h5_file:
+                    raise ScoringException(f"Group '{group_id}' not found in H5 file")
+                
+                group = h5_file[group_id]
+                model_data = {
+                    'intercept': group['intercept'][()] if 'intercept' in group else 0.0,
+                    'features': [f.decode() if isinstance(f, bytes) else f for f in group['features'][()]],
+                    'coefficients': group['coefficients'][()]
+                }
+                
+                logger.model_load("Successfully loaded model %s with %d features", 
+                                group_id, len(model_data['features']))
+                
+                self._cache[cache_key] = model_data
+                return model_data
+                
+        except Exception as e:
+            logger.error("Error loading model %s: %s", group_id, str(e))
+            raise
+
+class LinearModelScorer(BaseScorer):
+    def __init__(self, config: ModelConfig):
+        self.config = config
+        self.loader = H5ModelLoader(config.h5_path)
+        self.model_data = self.loader.load_model_data(config.group_id)
+        
+        self.features = np.array(self.model_data['features'])
+        self.coefficients = np.array(self.model_data['coefficients'])
+        self.intercept = float(self.model_data['intercept'])
+        
+        logger.info("Loaded model with %d features for group: %s", 
+                   len(self.features), config.group_id)
+    
+    def score(self, features_df: pd.DataFrame) -> np.ndarray:
+        logger.score_start("Starting scoring for %d records", len(features_df))
+        
+        start_time = time.time()
+        
+        try:
+            self.validate_features(features_df)
+            feature_matrix = features_df[self.features].values
+            scores = np.dot(feature_matrix, self.coefficients) + self.intercept
+            
+            duration = time.time() - start_time
+            logger.score_complete("Completed scoring in %.3f seconds, records: %d", 
+                                duration, len(features_df))
+            
+            return scores
+            
+        except Exception as e:
+            logger.error("Scoring failed: %s", str(e))
+            raise
+
+###Application Config
+# application_using_framework.py
+import logging
+from my_framework import configure_framework_logging
+from my_framework.core import ScoringFramework
+
+def setup_logging():
+    """Application-level logging setup"""
+    
+    # Configure root logger
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('app.log'),
+        ]
+    )
+    
+    # Configure framework logging
+    configure_framework_logging(
+        level=logging.DEBUG,  # Framework can log at DEBUG level
+        enable_file_logging=True,
+        log_file='framework.log',
+        max_bytes=50*1024*1024,  # 50MB
+        backup_count=3
+    )
+
+def main():
+    setup_logging()
+    
+    # Your application code
+    framework = ScoringFramework()
+    # ... rest of your code
+
+if __name__ == "__main__":
+    main()
+
+
+###Advanced
+# my_framework/config.py
+import json
+import yaml
+import logging.config
+from pathlib import Path
+
+def configure_logging_from_file(config_path: str):
+    """Configure logging from YAML/JSON file"""
+    config_path = Path(config_path)
+    
+    if config_path.suffix.lower() == '.yaml' or config_path.suffix.lower() == '.yml':
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+    else:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    
+    logging.config.dictConfig(config)
+
+# Example logging.yaml
+logging_config_yaml = """
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  detailed:
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+  simple:
+    format: '%(levelname)s - %(message)s'
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: simple
+    stream: ext://sys.stdout
+  
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: framework.log
+    maxBytes: 10485760  # 10MB
+    backupCount: 5
+
+loggers:
+  my_framework:
+    level: DEBUG
+    handlers: [console, file]
+    propagate: false
+
+root:
+  level: INFO
+  handlers: [console]
+"""
+
+###Context Mgr
+from contextlib import contextmanager
+import time
+
+@contextmanager
+def log_operation(operation_name: str, logger: logging.Logger = None):
+    """Context manager for logging operation start/complete"""
+    if logger is None:
+        logger = get_framework_logger()
+    
+    start_time = time.time()
+    logger.info("Starting operation: %s", operation_name)
+    
+    try:
+        yield
+        duration = time.time() - start_time
+        logger.info("Completed operation: %s (duration: %.3f seconds)", 
+                   operation_name, duration)
+    except Exception as e:
+        duration = time.time() - start_time
+        logger.error("Failed operation: %s (duration: %.3f seconds) - Error: %s", 
+                    operation_name, duration, str(e))
+        raise
+
+# Usage
+def score_with_logging(self, features_df: pd.DataFrame) -> np.ndarray:
+    with log_operation("scoring_operation"):
+        return self._score_internal(features_df)
+
+####Key Principles for Framework Logging:
+No Handlers in Library: Never add handlers to library loggers
+Proper Namespace: Use __name__ or package name for logger hierarchy
+NullHandler: Add NullHandler to prevent "No handler found" warnings
+Configurable: Provide configuration methods for applications to use
+Appropriate Levels: Use appropriate log levels (DEBUG, INFO, WARNING, ERROR)
+Structured Logging: Include context information in log messages
+Performance: Avoid expensive operations in logging calls
+Security: Don't log sensitive data like passwords or tokens
+This approach gives applications full control over logging while providing rich logging capabilities within your framework!
