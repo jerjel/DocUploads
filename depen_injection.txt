@@ -1,181 +1,156 @@
-****di_container.py*******
-  from __future__ import annotations
-from dataclasses import dataclass
-from inspect import signature, isclass
-from typing import Any, Callable, Dict, Type, TypeVar
+{
+  "name": "agentic-test-writer",
+  "displayName": "Agentic Test Writer",
+  "description": "Generate Python tests using GitHub Copilot agentic workflows",
+  "version": "1.0.0",
+  "publisher": "jerry",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "capabilities": {
+    "languageModels": true
+  },
+  "activationEvents": [
+    "onCommand:agenticTestWriter.generateTests"
+  ],
+  "main": "extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agenticTestWriter.generateTests",
+        "title": "Agentic: Generate Python Tests"
+      }
+    ]
+  },
+  "dependencies": {}
+}
 
-T = TypeVar("T")
+-------------------------------------
+const vscode = require("vscode");
+const path = require("path");
 
-class Scope:
-    SINGLETON = "singleton"
-    PROTOTYPE = "prototype"
+async function activate(context) {
+  let disposable = vscode.commands.registerCommand(
+    "agenticTestWriter.generateTests",
+    async function () {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        vscode.window.showErrorMessage("Open a Python file first.");
+        return;
+      }
 
-@dataclass
-class BeanDefinition:
-    cls: Type[Any]
-    scope: str = Scope.SINGLETON
-    factory: Callable[..., Any] | None = None
+      const document = editor.document;
+      const code = document.getText();
+      const fileName = path.basename(document.fileName);
 
-class Container:
-    def __init__(self) -> None:
-        self._beans: Dict[Type[Any], BeanDefinition] = {}
-        self._singletons: Dict[Type[Any], Any] = {}
+      // Select a Copilot chat model
+      const models = await vscode.lm.selectChatModels({
+        vendor: 'copilot'
+      });
 
-    def register(self, cls: Type[T], scope: str = Scope.SINGLETON, factory: Callable[..., T] | None = None) -> None:
-        self._beans[cls] = BeanDefinition(cls=cls, scope=scope, factory=factory)
+      if (!models || models.length === 0) {
+        vscode.window.showErrorMessage("No Copilot models available.");
+        return;
+      }
 
-    def get(self, cls: Type[T]) -> T:
-        # singleton cache
-        if cls in self._singletons:
-            return self._singletons[cls]
+      const model = models[0];
 
-        # definition lookup
-        if cls not in self._beans:
-            # auto-register simple classes if desired
-            self.register(cls, scope=Scope.PROTOTYPE)
+      const prompt = `
+You are an AI agent that writes high-quality Python unit tests.
 
-        definition = self._beans[cls]
-        instance = self._create_instance(definition)
+Output ONLY the complete Python code for pytest-style tests. Do not include any planning, explanation, workflow steps, markdown, or comments. Start directly with the imports.
 
-        if definition.scope == Scope.SINGLETON:
-            self._singletons[cls] = instance
+Focus on:
+- edge cases
+- error handling
+- correct assertions
+- realistic inputs
+- mock complex dependencies
+- full coverage
 
-        return instance
+Python file name: ${fileName}
 
-    def _create_instance(self, definition: BeanDefinition) -> Any:
-        target = definition.factory or definition.cls
+Code:
+${code}
+`;
 
-        if not isclass(definition.cls) and definition.factory is None:
-            raise ValueError(f"BeanDefinition must have a class or factory for {definition}")
+      const messages = [
+        vscode.LanguageModelChatMessage.User(prompt)
+      ];
 
-        sig = signature(target)
-        kwargs = {}
+      const token = new vscode.CancellationTokenSource().token;
+      let response;
+      try {
+        response = await model.sendRequest(messages, {}, token);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Failed to send request to Copilot: ${error.message}`);
+        return;
+      }
 
-        for name, param in sig.parameters.items():
-            if name == "self":
-                continue
-            if param.annotation is param.empty:
-                raise TypeError(f"Missing type hint for parameter '{name}' in {target}")
-            dep_type = param.annotation
-            kwargs[name] = self.get(dep_type)
+      if (!response || !response.stream) {
+        vscode.window.showErrorMessage("Copilot did not return a valid response.");
+        return;
+      }
 
-        return target(**kwargs)
+      let responseText = '';
+      try {
+        for await (const chunk of response.stream) {
+          // Handle different chunk formats
+          if (typeof chunk === 'string') {
+            responseText += chunk;
+          } else if (chunk && typeof chunk === 'object') {
+            // Try common properties for content
+            if (chunk.content) {
+              responseText += chunk.content;
+            } else if (chunk.text) {
+              responseText += chunk.text;
+            } else if (chunk.delta) {
+              responseText += chunk.delta;
+            } else if (chunk.value) {
+              responseText += chunk.value;
+            } else {
+              // Fallback: try to stringify or log for debugging
+              console.log('Unknown chunk format:', JSON.stringify(chunk, null, 2));
+            //   responseText += JSON.stringify(chunk);
+            }
+          }
+        }
+      } catch (error) {
+        vscode.window.showErrorMessage(`Failed to read Copilot response: ${error.message}`);
+        return;
+      }
 
-'''
-Registers types with singleton or prototype scope.
-Uses type hints on __init__ (or factory) to discover dependencies and resolve them recursively.
-​'''
+      if (!responseText) {
+        vscode.window.showErrorMessage("Copilot did not return any tests.");
+        return;
+      }
 
-# Module-level singleton container accessor ---------------------------------
-# Use get_container() to obtain the project's default Container instance.
-# This keeps a single Container instance shared across modules without forcing
-# users to rely on a metaclass or other singleton patterns.
-_default_container: Container | None = None
-from .logger import AppLogger  # type: ignore
-def get_container() -> Container:
-    """Return a shared Container instance (lazily created)."""
-    global _default_container
-    if _default_container is None:
-        _default_container = Container()
-        _default_container.register(AppLogger, scope=Scope.SINGLETON)
-    return _default_container
+      const testFileName = `test_${fileName}`;
+      const testUri = vscode.Uri.joinPath(
+        vscode.workspace.workspaceFolders[0].uri,
+        testFileName
+      );
 
-def get_logger() -> AppLogger:
-    """Shortcut to get the shared AppLogger from the default container."""
-    return get_container().get(AppLogger)
+      await vscode.workspace.fs.writeFile(
+        testUri,
+        Buffer.from(responseText, "utf8")
+      );
 
-def set_container(container: Container) -> None:
-    """Override the module-level default container (useful for tests)."""
-    global _default_container
-    _default_container = container
+      vscode.window.showInformationMessage(
+        `Generated tests → ${testFileName}`
+      );
 
+      const doc = await vscode.workspace.openTextDocument(testUri);
+      vscode.window.showTextDocument(doc);
+    }
+  );
 
-********beans.py*************
-class Database:
-    def __init__(self) -> None:
-        self.dsn = "postgresql://localhost:5432/app"
+  context.subscriptions.push(disposable);
+}
 
-    def query(self, sql: str) -> list[dict]:
-        print(f"Executing SQL: {sql}")
-        return []
+function deactivate() {}
 
-class UserRepository:
-    def __init__(self, db: Database) -> None:
-        self._db = db
-
-    def find_all(self) -> list[dict]:
-        return self._db.query("SELECT * FROM users")
-
-class UserService:
-    def __init__(self, user_repo: UserRepository) -> None:
-        self._user_repo = user_repo
-
-    def list_users(self) -> list[dict]:
-        return self._user_repo.find_all()
- 
-
-def main() -> None:
-    from di_container import get_container, Scope
-    container = get_container()
-    container.register(Database, scope=Scope.SINGLETON)
-    container.register(UserRepository, scope=Scope.SINGLETON)
-    container.register(UserService, scope=Scope.SINGLETON)
-
-    service1 = get_container().get(UserService)
-    service2 = get_container().get(UserService)
-
-    print('service1 == service2: ', service1 == service2 )           # same UserService
-    assert service1._user_repo is service2._user_repo
-    assert service1._user_repo._db is service2._user_repo._db
-
-if __name__ == "__main__":
-    # call demo only when run as script
-    main()
-
-****logger***********
-      import logging
-from typing import Optional
-
-
-class AppLogger:
-    """Lightweight application logger wrapper that's safe to register in the DI container.
-
-    Usage: declare a constructor param with type ``AppLogger`` and the container
-    will provide the singleton logger instance.
-    """
-
-    def __init__(self, name: Optional[str] = None) -> None:
-        name = name or "app"
-        self._logger = logging.getLogger(name)
-
-        # If no handlers are configured, add a StreamHandler with a readable format.
-        if not self._logger.handlers:
-            handler = logging.StreamHandler()
-            fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-            handler.setFormatter(fmt)
-            self._logger.addHandler(handler)
-            # Default to INFO to avoid noisy debug logs in apps; callers can adjust level.
-            self._logger.setLevel(logging.INFO)
-
-    def debug(self, msg: str, *args, **kwargs) -> None:
-        self._logger.debug(msg, *args, **kwargs)
-
-    def info(self, msg: str, *args, **kwargs) -> None:
-        self._logger.info(msg, *args, **kwargs)
-
-    def warning(self, msg: str, *args, **kwargs) -> None:
-        self._logger.warning(msg, *args, **kwargs)
-
-    def error(self, msg: str, *args, **kwargs) -> None:
-        self._logger.error(msg, *args, **kwargs)
-
-    def exception(self, msg: str, *args, **kwargs) -> None:
-        self._logger.exception(msg, *args, **kwargs)
-
-    def set_level(self, level: int) -> None:
-        self._logger.setLevel(level)
-
-    @property
-    def logger(self) -> logging.Logger:
-        """Access the underlying stdlib Logger if callers need advanced features."""
-        return self._logger
+module.exports = {
+  activate,
+  deactivate,
+};
