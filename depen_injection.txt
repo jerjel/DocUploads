@@ -1,156 +1,263 @@
+--------------------------------------------------------------package.json
 {
-  "name": "agentic-test-writer",
-  "displayName": "Agentic Test Writer",
-  "description": "Generate Python tests using GitHub Copilot agentic workflows",
-  "version": "1.0.0",
-  "publisher": "jerry",
-  "engines": {
-    "vscode": "^1.85.0"
-  },
-  "capabilities": {
-    "languageModels": true
-  },
-  "activationEvents": [
-    "onCommand:agenticTestWriter.generateTests"
-  ],
-  "main": "extension.js",
-  "contributes": {
-    "commands": [
-      {
-        "command": "agenticTestWriter.generateTests",
-        "title": "Agentic: Generate Python Tests"
-      }
-    ]
-  },
-  "dependencies": {}
+    "name": "rulebook-test-agent",
+    "displayName": "Rulebook Test Agent",
+    "description": "Generate Python tests using a custom rulebook and GitHub Copilot",
+    "version": "1.0.0",
+    "publisher": "Jerry Jacob",
+    "engines": {
+        "vscode": "^1.90.0"
+    },
+    "capabilities": {
+        "languageModels": true
+    },
+    "main": "extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "rulebookTestAgent.generateWithRulebook",
+                "title": "Agentic: Generate Tests from Rulebook"
+            },
+            {
+                "command": "rulebookTestAgent.setExternalKey",
+                "title": "Agentic: Set External API Key"
+            }
+        ],
+        "configuration": {
+            "title": "Rulebook Test Agent",
+            "properties": {
+                "rulebookTestAgent.provider": {
+                    "type": "string",
+                    "enum": [
+                        "Copilot",
+                        "External"
+                    ],
+                    "default": "Copilot",
+                    "description": "The LLM provider to use for test generation."
+                },
+                "rulebookTestAgent.external.baseUrl": {
+                    "type": "string",
+                    "default": "https://api.perplexity.ai",
+                    "description": "Base URL for the external LLM provider"
+                },
+                "rulebookTestAgent.external.model": {
+                    "type": "string",
+                    "default": "sonar",
+                    "description": "The model name for the external provider."
+                }
+            }
+        }
+    },
+    "dependencies": {}
 }
-
--------------------------------------
-const vscode = require("vscode");
-const path = require("path");
+---------------------------------------------------------------extension.js
+const vscode = require('vscode');
+const path = require('path');
+const fs = require('fs');
 
 async function activate(context) {
-  let disposable = vscode.commands.registerCommand(
-    "agenticTestWriter.generateTests",
-    async function () {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) {
-        vscode.window.showErrorMessage("Open a Python file first.");
-        return;
-      }
-
-      const document = editor.document;
-      const code = document.getText();
-      const fileName = path.basename(document.fileName);
-
-      // Select a Copilot chat model
-      const models = await vscode.lm.selectChatModels({
-        vendor: 'copilot'
-      });
-
-      if (!models || models.length === 0) {
-        vscode.window.showErrorMessage("No Copilot models available.");
-        return;
-      }
-
-      const model = models[0];
-
-      const prompt = `
-You are an AI agent that writes high-quality Python unit tests.
-
-Output ONLY the complete Python code for pytest-style tests. Do not include any planning, explanation, workflow steps, markdown, or comments. Start directly with the imports.
-
-Focus on:
-- edge cases
-- error handling
-- correct assertions
-- realistic inputs
-- mock complex dependencies
-- full coverage
-
-Python file name: ${fileName}
-
-Code:
-${code}
-`;
-
-      const messages = [
-        vscode.LanguageModelChatMessage.User(prompt)
-      ];
-
-      const token = new vscode.CancellationTokenSource().token;
-      let response;
-      try {
-        response = await model.sendRequest(messages, {}, token);
-      } catch (error) {
-        vscode.window.showErrorMessage(`Failed to send request to Copilot: ${error.message}`);
-        return;
-      }
-
-      if (!response || !response.stream) {
-        vscode.window.showErrorMessage("Copilot did not return a valid response.");
-        return;
-      }
-
-      let responseText = '';
-      try {
-        for await (const chunk of response.stream) {
-          // Handle different chunk formats
-          if (typeof chunk === 'string') {
-            responseText += chunk;
-          } else if (chunk && typeof chunk === 'object') {
-            // Try common properties for content
-            if (chunk.content) {
-              responseText += chunk.content;
-            } else if (chunk.text) {
-              responseText += chunk.text;
-            } else if (chunk.delta) {
-              responseText += chunk.delta;
-            } else if (chunk.value) {
-              responseText += chunk.value;
-            } else {
-              // Fallback: try to stringify or log for debugging
-              console.log('Unknown chunk format:', JSON.stringify(chunk, null, 2));
-            //   responseText += JSON.stringify(chunk);
-            }
-          }
+    // 1. Command to securely set External API Key
+    let setKeyDisposable = vscode.commands.registerCommand('rulebookTestAgent.setExternalKey', async () => {
+        const key = await vscode.window.showInputBox({
+            prompt: 'Enter your External LLM API Key',
+            password: true
+        });
+        if (key) {
+            await context.secrets.store('external_api_key', key);
+            vscode.window.showInformationMessage('External API Key saved securely.');
         }
-      } catch (error) {
-        vscode.window.showErrorMessage(`Failed to read Copilot response: ${error.message}`);
-        return;
-      }
+    });
 
-      if (!responseText) {
-        vscode.window.showErrorMessage("Copilot did not return any tests.");
-        return;
-      }
+    // 2. Main Generation Command
+    let generateDisposable = vscode.commands.registerCommand('rulebookTestAgent.generateWithRulebook', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showErrorMessage('Open a Python file first.');
+            return;
+        }
 
-      const testFileName = `test_${fileName}`;
-      const testUri = vscode.Uri.joinPath(
-        vscode.workspace.workspaceFolders[0].uri,
-        testFileName
-      );
+        const config = vscode.workspace.getConfiguration('rulebookTestAgent');
+        const provider = config.get('provider');
 
-      await vscode.workspace.fs.writeFile(
-        testUri,
-        Buffer.from(responseText, "utf8")
-      );
+        // Read Rulebook
+        let rulebookContent = '';
+        try {
+            const rulebookPath = path.join(context.extensionPath, 'rulebook.md');
+            rulebookContent = fs.readFileSync(rulebookPath, 'utf8');
+        } catch (err) {
+            vscode.window.showWarningMessage('Rulebook not found.');
+        }
 
-      vscode.window.showInformationMessage(
-        `Generated tests → ${testFileName}`
-      );
+        const sourceCode = editor.document.getText();
+        const fileName = path.basename(editor.document.fileName);
 
-      const doc = await vscode.workspace.openTextDocument(testUri);
-      vscode.window.showTextDocument(doc);
-    }
-  );
+        const prompt = `
+        You are an expert Python Test Engineer. Your task is to generate a comprehensive test suite for the provided Python code.
+        CRITICAL INSTRUCTION: You MUST follow the "Testing Rulebook" provided below.
+        
+        ### RULEBOOK STANDARDS ###
+        ${rulebookContent || 'Use pytest and follow AAA pattern.'}
+        
+        ### CODE TO TEST (${fileName}) ###
+        ${sourceCode}
+        
+        OUTPUT INSTRUCTIONS:
+        - Return ONLY the Python code. No markdown formatting.
+        `;
 
-  context.subscriptions.push(disposable);
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Generating tests using ${provider}...`,
+            cancellable: false
+        }, async () => {
+            try {
+                let responseText = '';
+                if (provider === 'Copilot') {
+                    responseText = await callCopilot(prompt);
+                } else {
+                    responseText = await callExternal(prompt, config, context);
+                }
+
+                if (!responseText) throw new Error("Empty response from LLM.");
+
+                // 1. Improved Code Extraction
+                let finalCode = responseText;
+                const pythonBlockRegex = /```python\n([\s\S]*?)```/;
+                const match = responseText.match(pythonBlockRegex);
+                if (match && match[1]) {
+                    finalCode = match[1].trim();
+                } else {
+                    // Fallback: strip any remaining backticks if the LLM didn't use a full block
+                    finalCode = responseText.replace(/```python|```/g, '').trim();
+                }
+
+                // 2. Determine project root and tests folder
+                const workspaceFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+                if (!workspaceFolder) {
+                    throw new Error("No workspace folder found. Open a workspace first.");
+                }
+                const rootPath = workspaceFolder.uri.fsPath;
+                const testsDirPath = path.join(rootPath, 'tests');
+
+                // 3. Ensure tests folder exists
+                if (!fs.existsSync(testsDirPath)) {
+                    fs.mkdirSync(testsDirPath);
+                }
+
+                // 4. Update test file naming (test_<filename>.py)
+                const originalFileName = path.basename(editor.document.fileName);
+                const testFileName = `test_${originalFileName}`;
+                const testFilePath = path.join(testsDirPath, testFileName);
+
+                await vscode.workspace.fs.writeFile(vscode.Uri.file(testFilePath), Buffer.from(finalCode, 'utf8'));
+
+                const doc = await vscode.workspace.openTextDocument(testFilePath);
+                await vscode.window.showTextDocument(doc);
+                vscode.window.showInformationMessage(`Generated using ${provider} in /tests.`);
+            } catch (err) {
+                vscode.window.showErrorMessage(`Error: ${err.message}`);
+            }
+        });
+    });
+
+    context.subscriptions.push(setKeyDisposable, generateDisposable);
 }
 
-function deactivate() {}
+async function callCopilot(prompt) {
+    const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+    if (models.length === 0) throw new Error('Copilot not available.');
 
-module.exports = {
-  activate,
-  deactivate,
-};
+    const response = await models[0].sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, new vscode.CancellationTokenSource().token);
+    let text = '';
+    for await (const chunk of response.stream) {
+        text += (typeof chunk === 'string' ? chunk : chunk.content || chunk.text || '');
+    }
+    return text;
+}
+
+async function callExternal(prompt, config, context) {
+    let baseUrl = config.get('external.baseUrl');
+    const model = config.get('external.model');
+    const apiKey = await context.secrets.get('external_api_key');
+
+    if (!apiKey) {
+        throw new Error("Missing API Key. Please run 'Agentic: Set External API Key' first.");
+    }
+
+    // Normalize URL: remove trailing slash and ensure it ends with /chat/completions
+    baseUrl = baseUrl.replace(/\/$/, "");
+    if (!baseUrl.endsWith("/chat/completions")) {
+        baseUrl += "/chat/completions";
+    }
+
+    const response = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+            model: model,
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.1
+        })
+    });
+
+    if (!response.ok) {
+        const errData = await response.text();
+        throw new Error(`External API Error: ${response.status} - ${errData}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+}
+
+function deactivate() { }
+
+module.exports = { activate, deactivate };
+-------------------------------------------------------------------------------------------rulebook.md
+# Python Testing Playbook
+
+This playbook defines the standards for generating high-quality Python tests. The AI agent MUST follow these rules when writing tests.
+
+## 1. Framework Selection
+- Always use `pytest`.
+- Always include `import pytest` at the top of the file.
+- Use `pytest-mock` (via the `mocker` fixture) instead of standard `unittest.mock` where possible for cleaner syntax.
+
+## 2. Structural Standards
+- **Arrange-Act-Assert (AAA)**: Every test must clearly separate the setup, execution, and validation phases.
+- **Naming Convention**: Test functions must follow `test_[function_or_method]_[scenario_or_input]`.
+    - *Example*: `test_calculate_total_with_empty_list`
+
+## 3. File and Directory Standards
+- **Test File Naming**: All generated test files MUST be named `test_<source_filename>.py`.
+- **Location**: All tests MUST be stored in a `tests/` directory at the project root.
+
+## 4. Recommended Libraries
+- **Networking/HTTP**: Use `responses` for mocking external API calls.
+- **Asynchronous Code**: Use `pytest-asyncio` for testing `async` functions.
+- **Data Generation**: Use `Faker` to generate realistic dummy data (names, emails, addresses).
+- **Time/Date**: Use `freezegun` if you need to mock time-dependent logic.
+
+## 5. Mocking & Isolation
+- **No Network/DB**: All external calls must be mocked.
+- **Mocking Strategy**: Preference for `mocker.patch` over `patch` decorators to keep test signatures clean.
+
+## 4. Edge Cases
+- Always include tests for:
+    - Empty inputs (lists, strings, dicts).
+    - `None` or null values.
+    - Large datasets.
+    - Error conditions (using `pytest.raises`).
+
+## 5. Documentation
+- Each test file should start with a brief comment explaining the scope of the tests.
+- Complex assertions should have a comment explaining the "why".
+
+## 6. Coverage Goals
+- Aim for 100% path coverage on the logic provided.
+
+## 7. Output Format
+- Return ONLY valid, executable Python code. 
+- Do not include any conversational text or markdown blocks unless explicitly using them as comments within the Python code.
