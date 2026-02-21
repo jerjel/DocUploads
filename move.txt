@@ -1,0 +1,761 @@
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------     extension.js      ------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+const vscode = require('vscode');
+const path = require('path');
+const fs = require('fs');
+
+// ---------------------------------------------------------------------------
+// CONSTANTS
+// ---------------------------------------------------------------------------
+const SKIP_DIRS = new Set([
+    'node_modules', '.git', '__pycache__', 'venv', '.venv', 'env',
+    'dist', 'build', '.tox', 'site-packages', 'migrations', '.mypy_cache'
+]);
+
+// ~120k chars ≈ 30k tokens — safe for most models with a generous system prompt
+const CHAR_BUDGET = 120_000;
+
+// ---------------------------------------------------------------------------
+// ACTIVATE
+// ---------------------------------------------------------------------------
+async function activate(context) {
+
+    // ── 1. Set API Key ───────────────────────────────────────────────────────
+    const setKeyDisposable = vscode.commands.registerCommand(
+        'migrationExtractor.setApiKey', async () => {
+            const key = await vscode.window.showInputBox({
+                prompt: 'Enter your External LLM API Key',
+                password: true,
+                ignoreFocusOut: true
+            });
+            if (key) {
+                await context.secrets.store('migration_extractor_api_key', key);
+                vscode.window.showInformationMessage('Migration Extractor: API Key saved securely.');
+            }
+        }
+    );
+
+    // ── 2. Main Extraction Command ───────────────────────────────────────────
+    const extractDisposable = vscode.commands.registerCommand(
+        'migrationExtractor.extractOutputCode', async () => {
+
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) {
+                vscode.window.showErrorMessage('Migration Extractor: Open a legacy Python file first.');
+                return;
+            }
+
+            const entryUri = editor.document.uri;
+            const fileExt = path.extname(entryUri.fsPath);                // .py
+            const fileName = path.basename(entryUri.fsPath);              // e.g. main.py
+
+            // Only Python files supported
+            if (fileExt !== '.py') {
+                vscode.window.showWarningMessage(
+                    'Migration Extractor: Multi-file scanning is currently supported for Python (.py) files only.'
+                );
+            }
+
+            // ── Step 1: Describe the TARGET OUTPUT ──────────────────────────
+            const targetOutput = await vscode.window.showInputBox({
+                title: 'Migration Extractor — Step 1 of 2',
+                prompt: 'Describe the OUTPUT you want to extract',
+                placeHolder: 'e.g., the final JSON invoice object returned to the caller',
+                ignoreFocusOut: true
+            });
+            if (!targetOutput) return;
+
+            // ── Step 2: Describe the INPUTS ─────────────────────────────────
+            const targetInputs = await vscode.window.showInputBox({
+                title: 'Migration Extractor — Step 2 of 2',
+                prompt: 'Describe the INPUTS available to the code',
+                placeHolder: 'e.g., customer_id (int), order_date (string YYYY-MM-DD)',
+                ignoreFocusOut: true
+            });
+            if (!targetInputs) return;
+
+            const config = vscode.workspace.getConfiguration('migrationExtractor');
+            const provider = config.get('provider');
+            const scanMode = config.get('scanMode') || 'Auto';
+            const maxFiles = config.get('maxFilesPerScan') || 30;
+
+            // ── Read the workspace root ──────────────────────────────────────
+            const workspaceFolder = vscode.workspace.getWorkspaceFolder(entryUri);
+            if (!workspaceFolder) {
+                vscode.window.showErrorMessage('Migration Extractor: No workspace folder found. Open a workspace first.');
+                return;
+            }
+            const workspaceRoot = workspaceFolder.uri.fsPath;
+
+            // ── Read the playbook ────────────────────────────────────────────
+            let playbookContent = '';
+            try {
+                const playbookPath = path.join(context.extensionPath, 'migration_playbook.md');
+                playbookContent = fs.readFileSync(playbookPath, 'utf8');
+            } catch (_) {
+                playbookContent = 'Extract only the code that produces the target output. Exclude everything else.';
+            }
+
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'Migration Extractor',
+                cancellable: false
+            }, async (progress) => {
+                try {
+                    // ── Collect files ────────────────────────────────────────
+                    let bundledContext = '';
+                    let includedFiles = [fileName];
+
+                    if (scanMode === 'ActiveFileOnly') {
+                        // Legacy single-file behaviour
+                        const sourceCode = editor.document.getText();
+                        bundledContext = formatFileBlock(fileName, sourceCode);
+                    } else {
+                        // Auto: follow Python imports from the entry file
+                        progress.report({ message: `Scanning Python imports from ${fileName}…` });
+
+                        const fileMap = collectWorkspaceFiles(workspaceRoot, fileExt, maxFiles);
+                        const entryRel = path.relative(workspaceRoot, entryUri.fsPath).replace(/\\/g, '/');
+
+                        const orderedPaths = buildImportGraph(entryRel, fileMap, workspaceRoot);
+                        const { bundle, files, truncated } = bundleFilesForPrompt(orderedPaths, fileMap);
+
+                        bundledContext = bundle;
+                        includedFiles = files;
+
+                        if (truncated) {
+                            vscode.window.showWarningMessage(
+                                `Migration Extractor: Reached the ${maxFiles}-file / character-budget limit. ` +
+                                `Some files were excluded. Increase 'maxFilesPerScan' in settings if needed.`
+                            );
+                        }
+
+                        progress.report({
+                            message: `Analyzing ${includedFiles.length} file(s) via ${provider}…`
+                        });
+                    }
+
+                    // ── Build prompt ─────────────────────────────────────────
+                    const prompt = buildExtractionPrompt(
+                        bundledContext, includedFiles, fileName,
+                        targetOutput, targetInputs, playbookContent
+                    );
+
+                    // ── Call LLM ─────────────────────────────────────────────
+                    let responseText = '';
+                    if (provider === 'Copilot') {
+                        responseText = await callCopilot(prompt);
+                    } else {
+                        responseText = await callExternal(prompt, config, context);
+                    }
+
+                    if (!responseText) throw new Error('Empty response from LLM.');
+
+                    // ── Strip markdown fences ────────────────────────────────
+                    let finalCode = responseText;
+                    const fenceMatch = responseText.match(/```(?:\w+)?\n([\s\S]*?)```/);
+                    if (fenceMatch) {
+                        finalCode = fenceMatch[1].trim();
+                    } else {
+                        finalCode = responseText.replace(/```\w*\s*|```/g, '').trim();
+                    }
+
+                    // ── Write to /migration_output/ ──────────────────────────
+                    const outputDir = path.join(workspaceRoot, 'migration_output');
+                    if (!fs.existsSync(outputDir)) {
+                        fs.mkdirSync(outputDir, { recursive: true });
+                    }
+
+                    const baseName = path.basename(fileName, fileExt);
+                    const safeOutputName = targetOutput
+                        .toLowerCase()
+                        .replace(/[^a-z0-9]+/g, '_')
+                        .replace(/^_|_$/g, '')
+                        .substring(0, 40);
+
+                    const outputFileName = `${baseName}__${safeOutputName}${fileExt}`;
+                    const outputPath = path.join(outputDir, outputFileName);
+
+                    await vscode.workspace.fs.writeFile(
+                        vscode.Uri.file(outputPath),
+                        Buffer.from(finalCode, 'utf8')
+                    );
+
+                    // ── Open side-by-side ────────────────────────────────────
+                    const doc = await vscode.workspace.openTextDocument(outputPath);
+                    await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Beside });
+
+                    vscode.window.showInformationMessage(
+                        `✅ Extracted from ${includedFiles.length} file(s) → /migration_output/${outputFileName}`
+                    );
+
+                } catch (err) {
+                    vscode.window.showErrorMessage(`Migration Extractor Error: ${err.message}`);
+                }
+            });
+        }
+    );
+
+    context.subscriptions.push(setKeyDisposable, extractDisposable);
+}
+
+// ---------------------------------------------------------------------------
+// FILE COLLECTION — gather all .py files in the workspace (up to maxFiles)
+// ---------------------------------------------------------------------------
+/**
+ * Walks the workspace directory tree and returns a Map of
+ * relative-posix-path → file content for every .py file found,
+ * skipping known noise directories and capping at maxFiles.
+ *
+ * @param {string} workspaceRoot  - Absolute path to the workspace root
+ * @param {string} ext            - File extension to collect (e.g. '.py')
+ * @param {number} maxFiles       - Hard cap on number of files collected
+ * @returns {Map<string, string>} relPath → content
+ */
+function collectWorkspaceFiles(workspaceRoot, ext, maxFiles) {
+    const fileMap = new Map();
+
+    function walk(dir) {
+        if (fileMap.size >= maxFiles) return;
+        let entries;
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+        catch (_) { return; }
+
+        for (const entry of entries) {
+            if (fileMap.size >= maxFiles) break;
+            if (entry.isDirectory()) {
+                if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+                    walk(path.join(dir, entry.name));
+                }
+            } else if (entry.isFile() && entry.name.endsWith(ext)) {
+                const absPath = path.join(dir, entry.name);
+                const relPath = path.relative(workspaceRoot, absPath).replace(/\\/g, '/');
+                try {
+                    const content = fs.readFileSync(absPath, 'utf8');
+                    fileMap.set(relPath, content);
+                } catch (_) { /* skip unreadable files */ }
+            }
+        }
+    }
+
+    walk(workspaceRoot);
+    return fileMap;
+}
+
+// ---------------------------------------------------------------------------
+// IMPORT GRAPH — BFS from entry file, following Python import statements
+// ---------------------------------------------------------------------------
+/**
+ * Parses Python `import X` and `from X import Y` statements and resolves them
+ * to relative file paths within the workspace.  Returns an ordered array of
+ * relative paths (entry file first, dependencies in BFS order).
+ *
+ * Handles:
+ *   import foo                  → foo.py
+ *   import foo.bar              → foo/bar.py
+ *   from foo import bar         → foo.py
+ *   from foo.bar import baz     → foo/bar.py
+ *   from . import utils         → <same-dir>/utils.py
+ *   from .utils import helper   → <same-dir>/utils.py
+ *   from ..common import x      → <parent-dir>/common.py
+ *
+ * @param {string}              entryRel   - Entry file relative path (posix)
+ * @param {Map<string,string>}  fileMap    - All workspace files
+ * @param {string}              _wsRoot    - Workspace root (unused here, kept for signature compat)
+ * @returns {string[]}  Ordered list of relative paths to include
+ */
+function buildImportGraph(entryRel, fileMap, _wsRoot) {
+    // Regex captures both:  import a.b.c   and   from a.b.c import ...
+    const IMPORT_RE = /^(?:import|from)\s+(\.{0,2}[\w.]*)/gm;
+
+    const visited = new Set();
+    const ordered = [];
+    const queue = [entryRel];
+
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (visited.has(current)) continue;
+        visited.add(current);
+        ordered.push(current);
+
+        const content = fileMap.get(current);
+        if (!content) continue;
+
+        const currentDir = current.includes('/') ? current.substring(0, current.lastIndexOf('/')) : '';
+
+        let match;
+        IMPORT_RE.lastIndex = 0;
+        while ((match = IMPORT_RE.exec(content)) !== null) {
+            const rawModule = match[1];          // e.g. '.utils', 'foo.bar', '..common'
+            const candidates = resolveImport(rawModule, currentDir, fileMap);
+            for (const c of candidates) {
+                if (!visited.has(c)) queue.push(c);
+            }
+        }
+    }
+
+    return ordered;
+}
+
+/**
+ * Attempts to resolve a Python module string to a relative file path
+ * that exists in fileMap.  Returns an array of matching paths (usually 0-1).
+ *
+ * @param {string} rawModule   - e.g. '.utils', 'foo.bar', '..helpers.pricing'
+ * @param {string} currentDir  - Directory of the importing file (posix, relative)
+ * @param {Map<string,string>} fileMap
+ * @returns {string[]}
+ */
+function resolveImport(rawModule, currentDir, fileMap) {
+    // Count leading dots for relative imports
+    const dotMatch = rawModule.match(/^(\.+)/);
+    const dots = dotMatch ? dotMatch[1].length : 0;
+    const modulePart = rawModule.replace(/^\.+/, '');      // strip leading dots
+
+    // Determine base directory based on dots
+    let baseDir = currentDir;
+    if (dots > 0) {
+        const parts = currentDir ? currentDir.split('/') : [];
+        // one dot = same dir, two dots = parent dir, etc.
+        const upLevels = dots - 1;
+        baseDir = parts.slice(0, Math.max(0, parts.length - upLevels)).join('/');
+    }
+
+    if (!modulePart) return [];   // bare 'from . import X' with no module — skip
+
+    // Convert dot-path to slash-path  (foo.bar.baz → foo/bar/baz)
+    const slashPath = modulePart.replace(/\./g, '/');
+    const candidates = [];
+
+    // Try as a direct module file: foo/bar.py
+    const asFilePath = baseDir ? `${baseDir}/${slashPath}.py` : `${slashPath}.py`;
+    if (fileMap.has(asFilePath)) candidates.push(asFilePath);
+
+    // Try as a package: foo/bar/__init__.py
+    const asInitPath = baseDir ? `${baseDir}/${slashPath}/__init__.py` : `${slashPath}/__init__.py`;
+    if (fileMap.has(asInitPath)) candidates.push(asInitPath);
+
+    // For absolute imports (no dots), also try relative to workspace root
+    if (dots === 0 && currentDir) {
+        const rootFilePath = `${slashPath}.py`;
+        if (fileMap.has(rootFilePath) && !candidates.includes(rootFilePath)) {
+            candidates.push(rootFilePath);
+        }
+    }
+
+    return candidates;
+}
+
+// ---------------------------------------------------------------------------
+// BUNDLE — assemble collected files into a prompt-ready string
+// ---------------------------------------------------------------------------
+/**
+ * Assembles an ordered list of files into a single multi-file context block,
+ * respecting a character budget.  Files are included in BFS order (entry first).
+ *
+ * @param {string[]}            orderedPaths - BFS-ordered relative paths
+ * @param {Map<string,string>}  fileMap
+ * @returns {{ bundle: string, files: string[], truncated: boolean }}
+ */
+function bundleFilesForPrompt(orderedPaths, fileMap) {
+    let bundle = '';
+    const included = [];
+    let truncated = false;
+
+    for (const relPath of orderedPaths) {
+        const content = fileMap.get(relPath);
+        if (content === undefined) continue;
+
+        const block = formatFileBlock(relPath, content);
+
+        if (bundle.length + block.length > CHAR_BUDGET) {
+            truncated = true;
+            break;
+        }
+
+        bundle += block;
+        included.push(relPath);
+    }
+
+    return { bundle, files: included, truncated };
+}
+
+/**
+ * Formats a single file as a labelled block for the LLM prompt.
+ * @param {string} relPath
+ * @param {string} content
+ * @returns {string}
+ */
+function formatFileBlock(relPath, content) {
+    return `\n=== FILE: ${relPath} ===\n${content}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// PROMPT BUILDER
+// ---------------------------------------------------------------------------
+/**
+ * Builds the multi-file extraction prompt sent to the LLM.
+ *
+ * @param {string}   bundledContext - All file blocks concatenated
+ * @param {string[]} includedFiles  - List of file relative paths included
+ * @param {string}   entryFileName  - Base name of the entry/active file
+ * @param {string}   targetOutput   - User's description of the output to extract
+ * @param {string}   targetInputs   - User's description of the available inputs
+ * @param {string}   playbook       - Content of migration_playbook.md
+ */
+function buildExtractionPrompt(bundledContext, includedFiles, entryFileName, targetOutput, targetInputs, playbook) {
+    const fileList = includedFiles.map((f, i) => `  ${i + 1}. ${f}`).join('\n');
+    const multiFile = includedFiles.length > 1;
+
+    return `You are a senior code migration engineer performing "output-focused program slicing."
+
+Your job is to analyze a ${multiFile ? 'multi-file Python codebase' : 'Python file'} and extract ONLY the code required to produce one specific, user-defined output — nothing more.
+
+=== MIGRATION PLAYBOOK (follow these rules exactly) ===
+${playbook}
+======================================================
+
+=== CODEBASE STRUCTURE ===
+Entry point : ${entryFileName}
+Files scanned (${includedFiles.length} total):
+${fileList}
+==========================
+
+=== TARGET OUTPUT (what you must produce) ===
+${targetOutput}
+
+=== AVAILABLE INPUTS (what the code receives) ===
+${targetInputs}
+
+=== LEGACY SOURCE CODE ===
+${bundledContext}
+==========================
+
+=== YOUR EXTRACTION TASK ===
+1. Perform a BACKWARDS data-flow trace starting from where the target output is produced.
+   The logic may be spread across multiple files — follow every import and function call.
+2. Identify every variable, computation, and function call that feeds (directly or transitively) into the output, across ALL files.
+3. Discard everything else ruthlessly — logging, unrelated writes, other outputs, authentication, etc.
+4. Produce a single self-contained Python function named extract_<short_output_name>(<inputs>) that:
+   - Returns the target output.
+   - Inlines any helper logic from other files as private functions above the main function.
+   - Adds a comment "# inlined from <filename>" above any inlined helper.
+   - Imports ONLY Python standard library modules.
+5. Begin the file with the MIGRATION EXTRACTION REPORT comment block as specified in the playbook.
+   The EXCLUDED line must list any files that contributed no logic to the output.
+
+CRITICAL: Return ONLY valid, executable Python code. No markdown fences. No explanations outside of code comments.`;
+}
+
+// ---------------------------------------------------------------------------
+// LLM CALLERS
+// ---------------------------------------------------------------------------
+
+/**
+ * Calls GitHub Copilot via the VSCode Language Model API.
+ */
+async function callCopilot(prompt) {
+    const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+    if (models.length === 0) throw new Error('GitHub Copilot is not available or not signed in.');
+
+    const response = await models[0].sendRequest(
+        [vscode.LanguageModelChatMessage.User(prompt)],
+        {},
+        new vscode.CancellationTokenSource().token
+    );
+
+    let text = '';
+    for await (const chunk of response.stream) {
+        text += (typeof chunk === 'string' ? chunk : (chunk.content || chunk.text || ''));
+    }
+    return text;
+}
+
+/**
+ * Calls an external OpenAI-compatible LLM endpoint.
+ */
+async function callExternal(prompt, config, context) {
+    let baseUrl = config.get('external.baseUrl') || 'https://api.openai.com';
+    const model = config.get('external.model') || 'gpt-4o';
+    const apiKey = await context.secrets.get('migration_extractor_api_key');
+
+    if (!apiKey) {
+        throw new Error(
+            "No API key found. Run 'Migration: Set External LLM API Key' first."
+        );
+    }
+
+    baseUrl = baseUrl.replace(/\/$/, '');
+    if (!baseUrl.endsWith('/chat/completions')) {
+        baseUrl += '/chat/completions';
+    }
+
+    const response = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+            model: model,
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.1   // Low temperature = deterministic, precise extraction
+        })
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`External API Error ${response.status}: ${errText}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+}
+
+// ---------------------------------------------------------------------------
+// DEACTIVATE
+// ---------------------------------------------------------------------------
+function deactivate() { }
+
+module.exports = { activate, deactivate };
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------     playbook.md       ------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Migration Extraction Playbook
+
+This playbook defines rules for the LLM when extracting output-focused code slices from legacy Python applications.
+Modify this file to customize behavior for your specific migration framework.
+
+## 1. Extraction Philosophy
+- Perform BACKWARDS data-flow analysis: start at the target output and trace every dependency upstream.
+- Extract the MINIMUM viable code that produces the target output with the given inputs.
+- Never include side effects unrelated to producing the output.
+- Logic may be spread across multiple files — follow every function call and import to find the full data path.
+
+## 2. What to ALWAYS EXCLUDE
+- Logging and print statements unrelated to the output value itself.
+- Database writes or saves that don't contribute to the output.
+- UI rendering, template rendering, or HTML generation (unless the output IS the HTML).
+- Authentication and authorization checks.
+- Unrelated error handling branches that don't affect the output.
+- Any other outputs the function produces besides the target.
+
+## 3. What to ALWAYS KEEP
+- Every variable that is read to compute the target output.
+- Every function call whose return value feeds (directly or transitively) into the output.
+- Transformations, mappings, calculations, and filters on the data path to the output.
+- Only the error handling branches that, if triggered, would change the output value.
+
+## 4. Output Structure Rules
+- The result MUST be a single, self-contained Python file with one main callable function.
+- Function signature: `extract_<output_name>(<inputs>)`
+- The function must return the target output value directly.
+- Helper functions inlined from other files must appear ABOVE the main function.
+- Do NOT add caching, logging, or retry logic — keep it pure.
+- Preserve original variable names to aid comparison with the legacy source.
+
+## 5. Multi-File Extraction Rules
+- Treat each `=== FILE: <path> ===` block as a separate Python module.
+- When inlining a helper from another file, add a comment `# inlined from <filename>` directly above it.
+- The final extracted function must import ONLY Python standard library modules (no third-party packages unless they are the direct source of the output data).
+- If a file in the scanned list contributed no logic to the output, list it in the `EXCLUDED` section of the report.
+
+## 6. Comment Header Requirements
+Every extracted file must begin with:
+```
+# === MIGRATION EXTRACTION REPORT ===
+# TARGET OUTPUT : <what was extracted>
+# INPUTS USED   : <input parameters>
+# FILES SCANNED : <comma-separated list of all files provided>
+# FILES USED    : <comma-separated list of files that contributed logic>
+# EXCLUDED      : <brief list of files or constructs dropped>
+# SOURCE FILE   : <original entry point filename>
+# =====================================
+```
+
+## 7. Code Quality
+- Do NOT optimize or refactor logic — fidelity to the original is paramount.
+- Do NOT rename variables or change data types.
+- If a legacy function does multiple things, extract only the relevant portion as a private helper.
+
+## 8. Output Format
+- Return ONLY valid, executable Python code in the same version as the source.
+- Do not include markdown formatting or explanations outside of code comments.
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------     package.json      ------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- 
+{
+    "name": "migration-extractor",
+    "displayName": "Migration Extractor",
+    "description": "Extract output-specific code slices from legacy applications to assist code migration.",
+    "version": "1.0.0",
+    "publisher": "Jerry Jacob",
+    "engines": {
+        "vscode": "^1.90.0"
+    },
+    "capabilities": {
+        "languageModels": true
+    },
+    "main": "extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "migrationExtractor.extractOutputCode",
+                "title": "Migration: Extract Code for Specific Output"
+            },
+            {
+                "command": "migrationExtractor.setApiKey",
+                "title": "Migration: Set External LLM API Key"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "migrationExtractor.extractOutputCode",
+                "key": "ctrl+shift+m",
+                "mac": "cmd+shift+m",
+                "when": "editorTextFocus"
+            }
+        ],
+        "configuration": {
+            "title": "Migration Extractor",
+            "properties": {
+                "migrationExtractor.provider": {
+                    "type": "string",
+                    "enum": [
+                        "Copilot",
+                        "External"
+                    ],
+                    "default": "External",
+                    "description": "The LLM provider to use for code extraction."
+                },
+                "migrationExtractor.external.baseUrl": {
+                    "type": "string",
+                    "default": "https://api.openai.com",
+                    "description": "Base URL for the external LLM provider (OpenAI-compatible API)."
+                },
+                "migrationExtractor.external.model": {
+                    "type": "string",
+                    "default": "gpt-4o",
+                    "description": "The model name to use for extraction."
+                },
+                "migrationExtractor.scanMode": {
+                    "type": "string",
+                    "enum": [
+                        "Auto",
+                        "ActiveFileOnly",
+                        "WholeWorkspace"
+                    ],
+                    "enumDescriptions": [
+                        "Follow Python import statements starting from the active file (recommended).",
+                        "Only send the currently active file to the LLM (fast, no cross-file tracing).",
+                        "Include every Python file in the workspace up to maxFilesPerScan."
+                    ],
+                    "default": "Auto",
+                    "description": "Controls which files are included in the LLM extraction request."
+                },
+                "migrationExtractor.maxFilesPerScan": {
+                    "type": "number",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Maximum number of Python files sent to the LLM in a single extraction request."
+                }
+            }
+        }
+    },
+    "dependencies": {}
+}
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------       README.MD       ------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- 
+
+# Migration Extractor — VS Code Extension
+
+Extract output-specific code slices from legacy applications to assist code migration.
+The LLM performs a **backwards data-flow analysis** from your target output, filtering out everything irrelevant, and generates a clean, self-contained function you can port to your new framework.
+
+---
+
+## How It Works
+
+1. Open a legacy source file in VS Code.
+2. Run **`Migration: Extract Code for Specific Output`** (`Ctrl+Shift+M` / `Cmd+Shift+M`).
+3. Answer two prompts:
+   - **Step 1 — Target Output**: Describe what output you want (e.g., `"the final invoice JSON object"`).
+   - **Step 2 — Inputs**: Describe the inputs available (e.g., `"customer_id (int), order_date (string)"`).
+4. The LLM traces backwards from your output, strips everything unrelated, and writes the extracted function to `/migration_output/<source>__<output>.py` — opened side-by-side for comparison.
+
+---
+
+## Setup
+
+### Option A — GitHub Copilot (no key needed)
+1. Ensure GitHub Copilot is installed and signed in.
+2. Set `migrationExtractor.provider` to `"Copilot"` in VS Code settings.
+
+### Option B — External LLM (OpenAI, Perplexity, Ollama, etc.)
+1. Run `Migration: Set External LLM API Key` via the Command Palette.
+2. Configure settings:
+
+```json
+"migrationExtractor.provider": "External",
+"migrationExtractor.external.baseUrl": "https://api.openai.com",
+"migrationExtractor.external.model": "gpt-4o"
+```
+
+---
+
+## Customizing Extraction Rules
+
+Edit **`migration_playbook.md`** in this folder to control:
+- What gets excluded (logging, auth, unrelated outputs)
+- What the extracted function structure looks like
+- The required comment header format
+
+The playbook is injected into every LLM prompt, so changes take effect immediately — no restart needed.
+
+---
+
+## Output
+
+Extracted files are written to `<workspace>/migration_output/` and follow this naming pattern:
+
+```
+migration_output/
+  original_file__target_output_name.py
+  billing_service__final_invoice_json.py
+  order_processor__shipment_record.js
+```
+
+Each file begins with an extraction report comment:
+
+```python
+# === MIGRATION EXTRACTION REPORT ===
+# TARGET OUTPUT : the final invoice JSON object
+# INPUTS USED   : customer_id (int), order_date (string)
+# EXCLUDED      : logging, DB writes, email notifications
+# SOURCE FILE   : billing_service.py
+# =====================================
+```
+
+---
+
+## Settings Reference
+
+| Setting | Default | Description |
+|---|---|---|
+| `migrationExtractor.provider` | `External` | `Copilot` or `External` |
+| `migrationExtractor.external.baseUrl` | `https://api.openai.com` | OpenAI-compatible base URL |
+| `migrationExtractor.external.model` | `gpt-4o` | Model name |
+
+---
+
+## Running Locally (Development)
+
+1. Open this folder in VS Code.
+2. Press `F5` to launch the Extension Development Host.
+3. In the new window, open any legacy project and run the command.
